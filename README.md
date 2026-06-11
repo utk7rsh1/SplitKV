@@ -1,48 +1,136 @@
 ﻿# SplitKV
 
-A persistent key-value storage engine written in C++17.
+A persistent key-value storage engine written in C++17. Built from scratch as a learning project to understand how LSM-tree based storage engines work internally.
 
-I built this to understand how database storage engines work internally. The design is based on the WiscKey paper, which stores keys and values separately to reduce write amplification during compaction.
+The architecture is inspired by the [WiscKey paper](https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf), which proposes separating keys from values to reduce write amplification during compaction.
+
+---
 
 ## How it works
 
 **Write path:**
-When you call `Put(key, value)`:
-1. The value is appended to a Value Log file (VLog), giving back a `{file_id, offset}` pointer
-2. The key and pointer are written to a Write-Ahead Log (WAL) for crash safety
-3. The key and pointer go into an in-memory sorted index called the MemTable (AVL tree)
-4. When the MemTable hits its size limit, it gets flushed to a sorted file on disk (SSTable)
+
+```
+Put(key, value)
+  -> append value to VLog (returns {file_id, offset} pointer)
+  -> write key + pointer to WAL (crash safety)
+  -> insert key + pointer into MemTable (in-memory sorted AVL tree)
+
+When MemTable is full:
+  -> MemTable becomes immutable
+  -> background thread flushes it to a new SSTable file on disk
+```
 
 **Read path:**
-When you call `Get(key)`:
-1. Check the active MemTable
-2. Check older in-memory MemTables not yet flushed
-3. Search SSTable files newest to oldest, using a Bloom filter to skip files that definitely do not have the key
-4. Once found, use the pointer to read the actual value from VLog
+
+```
+Get(key)
+  -> check active MemTable
+  -> check immutable MemTables (not yet flushed)
+  -> search SSTable levels, newest to oldest
+       (Bloom filter skips files that definitely don't have the key)
+  -> use VLog pointer to read the actual value
+```
 
 **Background:**
-- Compaction merges SSTables, removes deleted keys and old versions
-- Garbage collection scans old VLog segments and rewrites only live values
+- **Compaction** merges SSTables across levels, drops deleted keys and old versions
+- **Garbage Collection** scans VLog segments, rewrites live values, deletes the old segment
 
-## Components
+---
 
-- `avl_tree.h` - AVL tree backing the MemTable
-- `bloom_filter` - per-SSTable filter for fast negative lookups  
-- `vlog` - append-only value storage
-- `wal` - write-ahead log for crash recovery
-- `sstable` - sorted, immutable key index files
-- `db_impl` - orchestrates everything
+## Architecture
+
+```
+                   +------------------+
+  Put/Get/Delete   |     DBImpl       |
+ ----------------> |                  |
+                   | MemTable (AVL)   |
+                   | Immutable MTables|
+                   | SSTable Levels   |
+                   | VLog             |
+                   | WAL              |
+                   +------------------+
+                          |
+              +-----------+-----------+
+              |                       |
+         SSTable files            VLog files
+     (keys + pointers only)    (raw values only)
+```
+
+---
 
 ## Building
 
-```bash
-mkdir build && cd build
-cmake .. && cmake --build .
-```
-
-## Tools
+Requires CMake 3.16+ and a C++17 compiler (GCC 9+, Clang 10+, MSVC 2019+).
 
 ```bash
-./build/tools/splitkv-cli path/to/db        # interactive CLI
-./build/tools/splitkv-server path/to/db 7777  # TCP server
+mkdir build
+cd build
+cmake ..
+cmake --build .
 ```
+
+---
+
+## Usage
+
+### CLI tool
+
+```bash
+./build/tools/splitkv-cli path/to/database
+```
+
+Commands:
+```
+put mykey myvalue    # store a key-value pair
+get mykey            # retrieve a value
+delete mykey         # mark a key as deleted
+stats                # show basic stats
+compact              # trigger compaction manually
+gc                   # trigger garbage collection manually
+exit
+```
+
+### TCP server
+
+```bash
+./build/tools/splitkv-server path/to/database 7777
+```
+
+Connect with telnet or netcat:
+```
+PING          ->  +PONG
+PUT foo bar   ->  +OK
+GET foo       ->  $3<CR><LF>bar
+DEL foo       ->  +OK
+STATS         ->  (stats as text)
+```
+
+---
+
+## What I learned
+
+- How AVL trees work. The rotation cases (LL, RR, LR, RL) took me a while to get right.
+- Why you need to write to the WAL before updating the MemTable, so you can replay operations after a crash.
+- How Bloom filters work and why a 1% false positive rate is fine here.
+- What a sparse index is and why it is enough to find keys efficiently in a sorted file.
+- How key-value separation reduces write amplification. Compaction only touches keys, not values.
+- How `std::shared_mutex` works and when to use shared vs exclusive locks.
+- Some Windows/Linux file I/O differences. The `DeleteFile` macro conflict was annoying to debug.
+
+---
+
+## Things I would improve
+
+- The manifest format is very basic. A proper version would use atomic renames.
+- Bloom filters are rebuilt from scratch on startup instead of being persisted to disk.
+- GC only processes one VLog segment per run.
+- Error messages could be more informative in a lot of places.
+- No real benchmarks yet comparing write amplification to a naive approach.
+
+---
+
+## References
+
+- WiscKey: https://www.usenix.org/system/files/conference/fast16/fast16-papers-lu.pdf
+- LevelDB implementation notes: https://github.com/google/leveldb/blob/main/doc/impl.md
