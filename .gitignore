@@ -17,3 +17,6 @@ Makefile
 .DS_Store
 *.bak
 *.swp
+
+# generated files
+*.log
